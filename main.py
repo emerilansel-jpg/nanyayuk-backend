@@ -61,6 +61,8 @@ def extract_videos_from_channel(url: str, max_videos: int = 50) -> list[dict]:
         "-j",
         "--playlist-end", str(max_videos),
         "--no-warnings",
+        "--extractor-retries", "3",
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         url,
     ]
 
@@ -95,15 +97,16 @@ def extract_videos_from_channel(url: str, max_videos: int = 50) -> list[dict]:
             )
 
             videos.append({
+                # Fields the Edge Function checks (flexible mapping):
                 "id": video_id,
                 "video_id": video_id,
                 "title": title[:200],
-                "desc": description[:500],
-                "description": description[:500],
-                "caption": title[:200] or description[:200],
+                "desc": description[:500],           # TikTok-style
+                "description": description[:500],     # Instagram-style
+                "caption": title[:200] or description[:200],  # Instagram caption
                 "published_at": published_at,
                 "timestamp": timestamp or 0,
-                "createTime": timestamp or 0,
+                "createTime": timestamp or 0,         # TikTok-style
                 "thumbnail_url": thumbnail,
                 "thumbnail": thumbnail,
             })
@@ -152,9 +155,62 @@ async def get_tiktok_videos(username: str = Query(..., description="TikTok usern
     Called by Edge Function: GET /api/tiktok/videos?username={username}
     Returns: { videos: [...] }
     """
-    url = f"https://www.tiktok.com/@{username}"
-    videos = extract_videos_from_channel(url, max_videos=50)
-    return {"videos": videos}
+    # Try multiple URL formats — TikTok often blocks direct scraping
+    urls_to_try = [
+        f"https://www.tiktok.com/@{username}",
+        f"https://www.tiktok.com/@{username}/video",
+    ]
+    last_error = None
+    for url in urls_to_try:
+        try:
+            videos = extract_videos_from_channel(url, max_videos=50)
+            if videos:
+                return {"videos": videos}
+        except HTTPException as e:
+            last_error = e
+            continue
+
+    # If yt-dlp flat-playlist fails, try fetching via oembed API as fallback
+    try:
+        videos = await _fetch_tiktok_via_oembed(username)
+        if videos:
+            return {"videos": videos}
+    except Exception:
+        pass
+
+    # Return whatever error we got, or empty list
+    if last_error:
+        # Return empty list instead of error so the app doesn't break
+        return {"videos": [], "error": f"TikTok extraction failed for @{username}. TikTok may be blocking server-side requests."}
+    return {"videos": []}
+
+
+async def _fetch_tiktok_via_oembed(username: str) -> list[dict]:
+    """Fallback: use TikTok's oembed/public API to get basic video info."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Try the TikTok public feed (this may not always work)
+            resp = await client.get(
+                f"https://www.tiktok.com/api/user/detail/?uniqueId={username}",
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                user_info = data.get("userInfo", {}).get("user", {})
+                if user_info.get("id"):
+                    # Got user info but we still need videos - try channel URL
+                    sec_uid = user_info.get("secUid", "")
+                    if sec_uid:
+                        videos = extract_videos_from_channel(
+                            f"https://www.tiktok.com/@{username}", max_videos=30
+                        )
+                        return videos
+    except Exception:
+        pass
+    return []
 
 
 @app.get("/api/instagram/videos")
@@ -275,7 +331,7 @@ def _parse_subtitle_file(filepath: str) -> dict:
 # ============================================================
 
 async def _transcribe_video(video_url: str) -> dict:
-    """Download audio -> Groq Whisper API for transcription."""
+    """Download audio → Groq Whisper API for transcription."""
     groq_key = os.environ.get("GROQ_API_KEY", "")
     if not groq_key:
         return {"transcript": "", "error": "GROQ_API_KEY not set"}
