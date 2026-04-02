@@ -1,0 +1,12 @@
+# Render.com Blueprint - deploy as a free web service
+services:
+  - type: web
+    name: nanyayuk-backend
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: GROQ_API_KEY
+        sync: false  # Set manually in Render dashboard
